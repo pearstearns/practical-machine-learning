@@ -1,0 +1,302 @@
+---
+title: "Now You're Thinking with Machine Learning: Human Activity Recognition in Weight Lifting Exercises"
+author: "Ian Roberts"
+date: "March 29, 2017"
+output: html_document
+---
+
+## Introduction
+As opposed to the majority of current quantification of human movement, this dataset and subsequent project is focused on how well an activity was performed by the wearer, as opposed to which activity at which time. To measure this six young unexperienced weight lifters were asked to perform one set of 10 repetitions of the Unilateral Dumbbell Biceps Curl in five different fashions
+
+*Class A*: exactly according to the specification
+*Class B*: throwing the elbows to the front
+*Class C*: lifting the dumbbell only halfway
+*Class D*: lowering the dumbbell only half way
+*Class E*: throwing the hips to the front.
+
+Notice that only class A corresponds to the specified execution of the exercise, and others correspond to common mistakes. To ensure the quality of data, an experienced weight lifter was there to supervise the participants. More information is available from the website [here](http://groupware.les.inf.puc-rio.br/har#weight_lifting_exercises).
+
+##Preprocessing
+Quite a bit of preprocessing done to make this dataset complete. A total of 150 variables were complete after the process described below.
+
+First to load the dataset, removing those pesky *#DIV/0!* values, and renaming the mislabeled.
+```{r initial}
+training <- read.csv("c:/Users/RLRMDR/Downloads/pml-training.csv",na.strings = c("", "NA", "#DIV/0!"))
+names(training) <- gsub("picth", "pitch", names(training))
+```
+
+However, this is done, it leaves us with several empty columns, converting them to the type **logical**
+
+```{r spock}
+table(sapply(training, class))
+```
+
+```{r yeet, message=FALSE, warning=FALSE}
+library(plyr) ; library(dplyr)
+
+rowNum <- function(rn){
+    unlist(lapply(rn, function(x){
+        grep(x, names(training))
+    }))
+}
+
+yeet <- filter(ldply(training, class), V1 == "logical")$.id
+
+training <- training[,-rowNum(yeet)]
+dim(training)
+```
+The code above names a function **rowNum** which returns the row numbers from a list variable provided. A data.frame of the classes of all the variables is returned, and only the names of the variables which are type ***logical*** are
+stored in the variable *yeet*. Then the row numbers of the corresponding variables are removed from the dataset. 
+
+This still leaves plenty of missing values. 
+```{r na1}
+sum(as.numeric(is.na(training)))
+```
+
+It wasn't as simple as imputing from the mean, because the majority were missing, and not at random. What I found, was that there were values of all of the transformations of the sensor data on every 'yes' of the *new_window* variable. Here was my solution.
+
+```{r masterplan p1, results='hide'}
+chitz <- grep("yes", training$new_window)
+blips <- as.double(c(0,chitz + 1))[-(length(chitz) + 1)]
+
+for(i in chitz){2
+        training[i,][is.na(training[i,])] = 9999
+}
+
+count = c(1:length(chitz))
+splitVec <- vector(mode = "numeric", length = nrow(training))
+mapply(function(x,y,z){
+        splitVec[x:y] <<- z
+}, blips, chitz, count)
+
+training$splitVar <- splitVec
+
+splitDF <- split(training, training$splitVar)
+
+for(i in 1:length(splitDF)){
+        splitDF[[i]] <- splitDF[[i]] %>% 
+                mutate_at(funs(replace(., is.na(.), last(.))), .cols = c(1:154))
+}
+
+training <- do.call("rbind", splitDF)
+
+```
+
+The concept was simple: split by a variable, iteratively replace the missing values in the resulting list, and recombine. The execution, as always, was more difficult. *new_window* couldn't be split on because it only split into yes and no categories. *num_window* could not be split on either, because it didn't match with *new_window*. So a new variable, *splitvar* was created. 
+
+To do this, two values, *blips* (the row after a 'yes' in *new_window*) and *chitz* (the rows on which there are 'yes' values on *new_window*), were created. Each pair of these values denoted the length of a new dataset with exactly one 'yes' in the *new_window* variable. 
+
+Next, all NAs on the *chitz* were turned into the numeric 9999 because trying to do this with NAs would be like trying to divide by 0, not possible. 
+
+Two more values were created, *count*, which was as long as *chitz* (406), and *splitVec*, which was a numeric vector as long as the training set.
+
+Using mapply, the multivariate version of sapply which iterates through each element of each list together (1x-1y-1z, 2x-2y-2z,...nx-ny-nz), and for each range of rows denoted in *blips* and *chitz* the count variable is assigned to *splitVec*. 
+
+The newly filled *splitVec* is added to the training set as *splitVar*, then dataset is split by the new variable into a list of 406 dataframes, each with exactly one 'yes' in the *new_window* variable at the bottom of the dataset.
+
+For every column in every dataframe in the list, all NAs are replaced by the last value in the column. The list is then combined back into a datset.
+
+This still leaves us with all the NAs.
+
+```{r 9999}
+training[training == 9999] <- NA
+sum(as.numeric(is.na(training)))
+```
+
+However, they can be easily dispatched
+
+```{r imputation, message=FALSE, warning=FALSE}
+indexNum<- rowNum(filter(ldply(training, class), V1 == "factor")$.id)
+imputeNames <- filter(ldply(training[,-indexNum], function(x){sum(as.numeric(is.na(x))) / nrow(training)}), V1 > 0)$.id
+
+library(Hmisc)
+for(i in imputeNames){
+        training[,i] <- impute(training[,i])
+}
+
+for(i in rowNum(filter(ldply(training, class), V1 == "impute")$.id)){
+        training[,i] <- as.numeric(training[,i])
+}
+```
+
+For every column that isn't a factor variable whose percentage of NAs is above 0, they will be imputed using *Hmisc::impute*
+
+There's one more problem before a complete dataset is acheived, complete columns of zeros. This is dealt with in the same manner the logical columns were taken care of.     
+```{r mostel}
+filter(ldply(training[,-indexNum], sum), V1 == 0)$.id
+yeet <- filter(ldply(training[,-indexNum], sum), V1 == 0)$.id
+training <- training[,-c(1,rowNum(yeet), 155)]
+```
+
+##Model Building
+
+```{r splitting, message=FALSE, warning=FALSE}
+library(caret)
+
+inTrain <- createDataPartition(y = training$classe, p = .7, list = F)
+moveTrain <- training[inTrain,]
+moveTest <- training[-inTrain,]
+```
+
+Because the dataset was just a bit too big to do exploratory analysis on, I used recursive feature analysis to find the best ones.
+
+```{r rfe, message=FALSE, warning=FALSE}
+library(doParallel)
+registerDoParallel(detectCores() - 1)
+
+control <- rfeControl(functions=rfFuncs, method="cv", number=10, allowParallel = T)
+set.seed(7)
+rfeResults <- rfe(moveTrain[,1:149], moveTrain[,150], rfeControl = control)
+
+predictors(rfeResults)
+```
+
+Now to fit our four models, Boosting and Random Forest with both the rfe variables and the whole set, with 10-fold cross-validation
+
+###Boosting
+
+```{r gbm}
+control <- trainControl(method="cv", number=10, allowParallel = T)
+
+set.seed(8)
+modFitGBM1 <- train(classe ~ cvtd_timestamp + var_accel_dumbbell + min_roll_forearm + avg_roll_dumbbell + raw_timestamp_part_1 + avg_roll_belt + avg_pitch_forearm + num_window, data = moveTrain, method = "gbm", trControl = control, verbose = F)
+
+set.seed(9)
+modFitGBM2 <- train(classe ~ ., data = moveTrain, method = "gbm", trControl = control, verbose = F)
+
+confusionMatrix(predict(modFitGBM1, moveTest[,-150]), moveTest$classe)
+confusionMatrix(predict(modFitGBM2, moveTest[,-150]), moveTest$classe)
+
+
+plot(modFitGBM1, ylim=c(0.9, 1))
+plot(modFitGBM2, ylim=c(0.9, 1))
+```
+###Random Forest
+```{r rf}
+set.seed(10)
+modFitRF1 <- train(classe ~ cvtd_timestamp + var_accel_dumbbell + min_roll_forearm + avg_roll_dumbbell + raw_timestamp_part_1 + avg_roll_belt + avg_pitch_forearm + num_window, data = moveTrain, method = "rf", trControl = control)
+
+set.seed(11)
+modFitRF2 <- train(classe ~ ., data = moveTrain, method = "rf", trControl = control)
+
+cmRF1 <- confusionMatrix(predict(modFitRF1, moveTest[,-150]), moveTest$classe) ; cmRF1
+cmRF2 <- confusionMatrix(predict(modFitRF2, moveTest[,-150]), moveTest$classe) ; cmRF2
+
+plot(cmRF1$table, col = cmRF1$byClass, main = paste("Random Forest Accuracy =", round(cmRF1$overall['Accuracy'], 3)))
+plot(cmRF2$table, col = cmRF2$byClass, main = paste("Random Forest Accuracy =", round(cmRF2$overall['Accuracy'], 3)))
+
+```
+
+##Conclusion
+Random forest gained just a hair better predictions than the gbm. But the perfect accuracy of RF1 makes me think that it's just a touch overfitted. 
+
+Here are my predictions for the test data, which I formatted to be the same as my training set by downloading the entire WLE set (stored in **big**), applied the same transformations, and used **dplyr::filter** with the first 10 variables of the test data to result in 20 full rows for the test data
+
+While the out of sample error based on the holdout would technically be 0, that's incredibly optimistic and very near impossible on a dataset this big. I'm guessing my true OOB error is about 90%, at the lowest 85%.
+```{r big, echo=FALSE, warning=FALSE}
+big <- read.csv("c:/Users/RLRMDR/Downloads/WLE.csv", na.strings = c("", "NA", "#DIV/0!"))
+
+names(big) <- gsub("picth", "pitch", names(big))
+
+rowNum <- function(rn){
+        unlist(lapply(rn, function(x){
+                grep(x, names(big))
+        }))
+}
+
+yeet <- filter(ldply(big, class), V1 == "logical")$.id
+
+big <- big[,-rowNum(yeet)]
+chitz <- grep("yes", big$new_window)
+blips <- as.double(c(0,chitz + 1))[-(length(chitz) + 1)]
+
+for(i in chitz){
+        big[i,][is.na(big[i,])] = 9999
+}
+
+count = c(1:length(chitz))
+splitVec <- vector(mode = "numeric", length = nrow(big))
+mapply(function(x,y,z){
+        splitVec[x:y] <<- z
+}, blips, chitz, count)
+
+big$splitVar <- splitVec
+
+splitDF <- split(big, big$splitVar)
+
+for(i in 1:length(splitDF)){
+        splitDF[[i]] <- splitDF[[i]] %>% 
+                mutate_at(funs(replace(., is.na(.), last(.))), .cols = c(1:154))
+}
+
+big <- do.call("rbind", splitDF)
+big[big == 9999] <- NA
+
+indexNum<- rowNum(filter(ldply(big, class), V1 == "factor")$.id)
+imputeNames <- filter(ldply(big[,-indexNum], function(x){sum(as.numeric(is.na(x))) / nrow(big)}), V1 > 0)$.id
+
+library(Hmisc)
+for(i in imputeNames){
+        big[,i] <- impute(big[,i])
+}
+
+for(i in rowNum(filter(ldply(big, class), V1 == "impute")$.id)){
+        big[,i] <- as.numeric(big[,i])
+}
+
+yeet <- filter(ldply(big[,-indexNum], sum), V1 == 0)$.id
+big <- big[,-c(rowNum(yeet), 154)]
+```
+
+```{r test}
+dim(big)
+sum(as.numeric(is.na(big)))
+
+
+officialTest <- read.csv("c:/Users/RLRMDR/Downloads/pml-testing.csv", na.strings = c("", "NA", "#DIV/0!"))
+
+newTest <- as.data.frame(filter(big, 
+                                raw_timestamp_part_1 == officialTest[1,3], 
+                                raw_timestamp_part_2 == officialTest[1,4],
+                                num_window == officialTest[1,7],
+                                roll_belt == officialTest[1,8],
+                                pitch_belt == officialTest[1,9],
+                                yaw_belt == officialTest[1,10],
+                                total_accel_belt == officialTest[1,11],
+                                gyros_belt_x == officialTest[1,37],
+                                gyros_belt_y == officialTest[1,38],
+                                gyros_belt_z == officialTest[1,39]))
+
+for(i in 2:20){
+        newTest[i,] <- as.data.frame(filter(big, 
+                                            raw_timestamp_part_1 == officialTest[i,3], 
+                                            raw_timestamp_part_2 == officialTest[i,4],
+                                            num_window == officialTest[i,7],
+                                            roll_belt == officialTest[i,8],
+                                            pitch_belt == officialTest[i,9],
+                                            yaw_belt == officialTest[i,10],
+                                            total_accel_belt == officialTest[i,11],
+                                            gyros_belt_x == officialTest[i,37],
+                                            gyros_belt_y == officialTest[i,38],
+                                            gyros_belt_z == officialTest[i,39]))
+}
+
+newTest$problem_id <- 1:20
+
+modFitRF2$xlevels$cvtd_timestamp <- union(modFitRF2$xlevels$cvtd_timestamp, levels(newTest$cvtd_timestamp))
+
+levels(newTest$new_window) <- union(levels(training$new_window), levels(newTest$new_window))
+levels(newTest$user_name) <- union(levels(training$user_name), levels(newTest$user_name))
+levels(newTest$cvtd_timestamp) <- union(levels(training$cvtd_timestamp), levels(newTest$cvtd_timestamp))
+
+set.seed(12)
+predict(modFitRF2, newTest)
+```
+
+```{r push, echo=FALSE, message=FALSE, warning=FALSE}
+#since the models are so big, they take a while to run even with parallel processing
+#so i set this up so it will tell me when it's done
+#save me the perpetual 'is it done' dance
+library(RPushbullet)
+pbPost(type = 'note', title = '12 LONG YEARS', body = 'IN AZKABAN')
+```
